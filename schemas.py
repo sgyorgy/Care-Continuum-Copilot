@@ -3,10 +3,10 @@ schemas.py — Contract-first, demo-safe, provider-swappable data models.
 
 Design goals:
 - Strict + explicit schemas for every API boundary (JSON in/out)
-- Timezone-safe timestamps
+- Timezone-safe timestamps with consistent UTC "Z" JSON serialization
 - "Demo never breaks": sensible defaults + normalization (e.g., SOAP sections)
-- Built-in safety metadata hooks (PII suspicion flags, not-medical-advice)
-- Great JSON Schema output (for docs / validators / frontend typing)
+- Built-in safety/provenance hooks (PII suspicion flags, not-medical-advice, provider info)
+- Great JSON Schema output (docs / validators / frontend typing)
 """
 
 from __future__ import annotations
@@ -14,17 +14,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 from uuid import UUID, uuid4
+import hashlib
 import re
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
 
 # -----------------------------------------------------------------------------
 # Constants / helpers
@@ -32,14 +28,19 @@ from pydantic import (
 
 UTC = timezone.utc
 
-# Lightweight PII/PHI suspicion patterns (do NOT claim perfect detection).
+# Lightweight PII/PHI suspicion patterns (heuristic; do NOT claim perfect detection).
+# Keep conservative: flag suspicious stuff without blocking flows.
 _PII_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+    # Conservative phone-ish pattern (will have false positives; that's okay for "suspicion" only)
     ("phone", re.compile(r"\b(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?)?\d{3}[\s-]?\d{3,4}\b")),
     ("ipv4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    ("url", re.compile(r"\bhttps?://\S+\b", re.IGNORECASE)),
     # Generic "ID-like" long digit sequences (kept conservative)
     ("long_digits", re.compile(r"\b\d{9,}\b")),
 )
+
+_ALLOWED_EVIDENCE_KEYS = {"subjective", "objective", "assessment", "plan"}
 
 def _ensure_tz_aware(dt: datetime) -> datetime:
     if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
@@ -47,8 +48,26 @@ def _ensure_tz_aware(dt: datetime) -> datetime:
         return dt.replace(tzinfo=UTC)
     return dt
 
+def _to_utc(dt: datetime) -> datetime:
+    return _ensure_tz_aware(dt).astimezone(UTC)
+
+def _dt_to_json(dt: datetime) -> str:
+    # Stable ISO8601 "Z" (microseconds trimmed to reduce churn).
+    dtu = _to_utc(dt).replace(microsecond=0)
+    return dtu.isoformat().replace("+00:00", "Z")
+
 def _compact_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
+def _slug(s: str, *, max_len: int = 48) -> str:
+    """
+    Simple, UI-friendly slug for tags/flags/metrics.
+    """
+    s2 = _compact_ws(s).lower()
+    s2 = re.sub(r"[^a-z0-9_-]+", "-", s2).strip("-_")
+    if len(s2) > max_len:
+        s2 = s2[:max_len].rstrip("-_")
+    return s2
 
 def _pii_signals(text: str) -> List[str]:
     hits: List[str] = []
@@ -56,6 +75,9 @@ def _pii_signals(text: str) -> List[str]:
         if pattern.search(text or ""):
             hits.append(name)
     return hits
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 # -----------------------------------------------------------------------------
@@ -90,6 +112,18 @@ class RiskLevel(str, Enum):
     unknown = "unknown"
 
 
+class DemoMode(str, Enum):
+    """
+    Golden = fully offline (prebaked outputs)
+    Local  = mock/local providers
+    Azure  = Azure STT + Azure OpenAI/Foundry (+ optional TA4H)
+    """
+    golden = "golden"
+    local = "local"
+    azure = "azure"
+    unknown = "unknown"
+
+
 # -----------------------------------------------------------------------------
 # Shared / base models
 # -----------------------------------------------------------------------------
@@ -99,13 +133,16 @@ class ModelBase(BaseModel):
     Base config:
     - forbid extra fields (catches mistakes early)
     - validate assignment (useful when UI edits objects)
-    - strict-ish behavior (we still allow reasonable coercions like UUID strings)
+    - allow population by field name even when alias exists (critical for DateRange.from)
+    - consistent datetime JSON ("Z") for frontend stability
     """
     model_config = ConfigDict(
         extra="forbid",
         validate_assignment=True,
         str_strip_whitespace=True,
         frozen=False,
+        populate_by_name=True,
+        json_encoders={datetime: _dt_to_json},
     )
 
 
@@ -116,11 +153,15 @@ class SafetyMeta(ModelBase):
     """
     not_medical_advice: bool = Field(
         default=True,
-        description="Always true for this project; this system does not provide medical advice.",
+        description="Always true; this system does not provide medical advice.",
     )
     no_diagnosis_claims: bool = Field(
         default=True,
         description="Always true; system must avoid diagnosing diseases/conditions.",
+    )
+    synthetic_demo_only: bool = Field(
+        default=True,
+        description="Always true; demos/tests must use synthetic or anonymized content only.",
     )
     pii_suspected: bool = Field(
         default=False,
@@ -129,6 +170,7 @@ class SafetyMeta(ModelBase):
     pii_signals: List[str] = Field(
         default_factory=list,
         description="Which heuristic PII patterns were detected (e.g., email, phone).",
+        max_length=12,
     )
     redaction_applied: bool = Field(
         default=False,
@@ -137,7 +179,28 @@ class SafetyMeta(ModelBase):
     notes: List[str] = Field(
         default_factory=list,
         description="Optional safety notes (e.g., 'objective data not provided; set to Not provided.').",
+        max_length=24,
     )
+
+
+class ProvenanceMeta(ModelBase):
+    """
+    Where did this output come from? (great for demos + debugging + judging clarity)
+    """
+    request_id: Optional[str] = Field(default=None, max_length=64)
+    demo_mode: DemoMode = Field(default=DemoMode.unknown)
+    stt_provider: Optional[str] = Field(default=None, max_length=64)
+    llm_provider: Optional[str] = Field(default=None, max_length=64)
+    model: Optional[str] = Field(default=None, max_length=128)
+    latency_ms: Optional[int] = Field(default=None, ge=0, le=10_000)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+
+    @field_validator("generated_at", mode="before")
+    @classmethod
+    def _tz_generated(cls, v: Any) -> Any:
+        if isinstance(v, datetime):
+            return _to_utc(v)
+        return v
 
 
 class DateRange(ModelBase):
@@ -179,7 +242,7 @@ class Symptom(ModelBase):
     @classmethod
     def _tz_symptom_onset(cls, v: Any) -> Any:
         if isinstance(v, datetime):
-            return _ensure_tz_aware(v)
+            return _to_utc(v)
         return v
 
     @model_validator(mode="after")
@@ -222,7 +285,7 @@ class DiaryEntry(ModelBase):
     medications: List[Medication] = Field(default_factory=list)
     tags: List[str] = Field(
         default_factory=list,
-        description="Short tags for filtering (lowercase recommended).",
+        description="Short tags for filtering (normalized).",
         max_length=32,  # list length constraint
     )
     audio_ref: Optional[str] = Field(
@@ -231,12 +294,13 @@ class DiaryEntry(ModelBase):
         description="Optional reference to audio blob (if voice input).",
     )
     safety: SafetyMeta = Field(default_factory=SafetyMeta)
+    provenance: ProvenanceMeta = Field(default_factory=ProvenanceMeta)
 
     @field_validator("timestamp", mode="before")
     @classmethod
     def _tz_timestamp(cls, v: Any) -> Any:
         if isinstance(v, datetime):
-            return _ensure_tz_aware(v)
+            return _to_utc(v)
         return v
 
     @field_validator("text", mode="after")
@@ -248,15 +312,8 @@ class DiaryEntry(ModelBase):
     @classmethod
     def _normalize_tags(cls, v: List[str]) -> List[str]:
         cleaned: List[str] = []
-        for tag in v:
-            t = _compact_ws(tag).lower()
-            if not t:
-                continue
-            # Keep tags simple & UI-friendly
-            if len(t) > 24:
-                t = t[:24]
-            # allow letters/numbers/_/-
-            t = re.sub(r"[^a-z0-9_-]+", "-", t).strip("-_")
+        for tag in v or []:
+            t = _slug(tag, max_len=24)
             if t and t not in cleaned:
                 cleaned.append(t)
         return cleaned[:32]
@@ -269,6 +326,11 @@ class DiaryEntry(ModelBase):
             self.safety.pii_suspected = True
             self.safety.pii_signals = sorted(set(self.safety.pii_signals + signals))
             self.safety.notes.append("PII suspected in diary text (heuristic).")
+
+        # Demo-safe: voice entries ideally have audio_ref, but do not hard-fail.
+        if self.source == EntrySource.voice and not self.audio_ref:
+            self.safety.notes.append("Voice entry missing audio_ref; continuing demo-safe.")
+
         return self
 
 
@@ -285,7 +347,7 @@ class TrendPoint(ModelBase):
 
     @model_validator(mode="after")
     def _norm(self) -> "TrendPoint":
-        self.metric = _compact_ws(self.metric)
+        self.metric = _slug(self.metric, max_len=64) or self.metric.strip()
         if self.label is not None:
             self.label = _compact_ws(self.label)
         if self.notes is not None:
@@ -300,7 +362,7 @@ class TrendInsight(ModelBase):
 
     @model_validator(mode="after")
     def _norm(self) -> "TrendInsight":
-        self.metric = _compact_ws(self.metric)
+        self.metric = _slug(self.metric, max_len=64) or self.metric.strip()
         if self.notes is not None:
             self.notes = _compact_ws(self.notes)
         return self
@@ -325,7 +387,7 @@ class DiarySummary(ModelBase):
     )
     risk_flags: List[str] = Field(
         default_factory=list,
-        description="Short labels (e.g., 'persistent_symptoms', 'worsening_trend').",
+        description="Short normalized labels (e.g., 'persistent_symptoms', 'worsening_trend').",
         max_length=12,
     )
     shareable_previsit_summary: str = Field(
@@ -335,12 +397,13 @@ class DiarySummary(ModelBase):
         description="Clinician-friendly paragraph + bullets; copy/export target.",
     )
     safety: SafetyMeta = Field(default_factory=SafetyMeta)
+    provenance: ProvenanceMeta = Field(default_factory=ProvenanceMeta)
 
     @field_validator("highlights", "gentle_suggestions", mode="after")
     @classmethod
     def _clean_bullets(cls, v: List[str]) -> List[str]:
         cleaned: List[str] = []
-        for item in v:
+        for item in v or []:
             s = _compact_ws(item)
             if s:
                 cleaned.append(s)
@@ -353,6 +416,16 @@ class DiarySummary(ModelBase):
                 seen.add(key)
                 out.append(s)
         return out
+
+    @field_validator("risk_flags", mode="after")
+    @classmethod
+    def _norm_flags(cls, v: List[str]) -> List[str]:
+        out: List[str] = []
+        for f in v or []:
+            s = _slug(f, max_len=32)
+            if s and s not in out:
+                out.append(s)
+        return out[:12]
 
     @field_validator("shareable_previsit_summary", mode="after")
     @classmethod
@@ -403,14 +476,28 @@ class SoapNote(ModelBase):
     objective: List[str] = Field(default_factory=list, description="Vitals/exam/labs if provided; otherwise 'Not provided.'")
     assessment: List[str] = Field(default_factory=list, description="Clinical impression WITHOUT diagnosis claims.")
     plan: List[str] = Field(default_factory=list, description="Next steps (tests, follow-up, education).")
+
+    # Anti-hallucination / judging-friendly extras (optional):
+    not_provided: List[str] = Field(
+        default_factory=list,
+        description="Which content areas were missing from input (e.g., ['objective']).",
+        max_length=16,
+    )
+    evidence_quotes: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Optional supporting snippets keyed by section: subjective/objective/assessment/plan (short, few items).",
+    )
+
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="Free-form metadata (e.g., source='transcript', confidence notes).",
     )
     safety: SafetyMeta = Field(default_factory=SafetyMeta)
+    provenance: ProvenanceMeta = Field(default_factory=ProvenanceMeta)
 
-    _MIN_LINE_LEN: ClassVar[int] = 1
     _MAX_LINE_LEN: ClassVar[int] = 400
+    _MAX_EVIDENCE_QUOTES_PER_KEY: ClassVar[int] = 3
+    _MAX_EVIDENCE_QUOTE_LEN: ClassVar[int] = 220
 
     @staticmethod
     def _normalize_lines(lines: Sequence[str]) -> List[str]:
@@ -432,26 +519,67 @@ class SoapNote(ModelBase):
                 out.append(s)
         return out
 
+    @staticmethod
+    def _normalize_evidence(evidence: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for k, quotes in (evidence or {}).items():
+            key = _slug(k, max_len=24)
+            if key not in _ALLOWED_EVIDENCE_KEYS:
+                continue
+            cleaned: List[str] = []
+            for q in quotes or []:
+                s = _compact_ws(str(q))
+                if not s:
+                    continue
+                if len(s) > SoapNote._MAX_EVIDENCE_QUOTE_LEN:
+                    s = s[: SoapNote._MAX_EVIDENCE_QUOTE_LEN].rstrip() + "…"
+                cleaned.append(s)
+            # de-dup preserve order
+            uniq: List[str] = []
+            seen = set()
+            for s in cleaned:
+                ks = s.lower()
+                if ks not in seen:
+                    seen.add(ks)
+                    uniq.append(s)
+            if uniq:
+                out[key] = uniq[: SoapNote._MAX_EVIDENCE_QUOTES_PER_KEY]
+        return out
+
     @model_validator(mode="after")
     def _canonicalize(self) -> "SoapNote":
         self.subjective = self._normalize_lines(self.subjective)
         self.objective = self._normalize_lines(self.objective)
         self.assessment = self._normalize_lines(self.assessment)
         self.plan = self._normalize_lines(self.plan)
+        self.evidence_quotes = self._normalize_evidence(self.evidence_quotes)
 
         # Ensure non-empty sections with safe defaults.
+        missing: List[str] = []
         if not self.subjective:
             self.subjective = ["Not provided."]
+            missing.append("subjective")
             self.safety.notes.append("Subjective empty; set to 'Not provided.'")
         if not self.objective:
             self.objective = ["Not provided."]
+            missing.append("objective")
             self.safety.notes.append("Objective empty; set to 'Not provided.'")
         if not self.assessment:
             self.assessment = ["Not provided."]
+            missing.append("assessment")
             self.safety.notes.append("Assessment empty; set to 'Not provided.'")
         if not self.plan:
             self.plan = ["Not provided."]
+            missing.append("plan")
             self.safety.notes.append("Plan empty; set to 'Not provided.'")
+
+        # Merge into not_provided (stable ordering)
+        merged = []
+        for m in (self.not_provided or []) + missing:
+            s = _slug(m, max_len=24)
+            if s and s not in merged:
+                merged.append(s)
+        self.not_provided = merged[:16]
 
         # Non-blocking PII suspicion across sections
         joined = "\n".join(self.subjective + self.objective + self.assessment + self.plan)
@@ -483,7 +611,14 @@ class ClinicalNoteResult(ModelBase):
     """
     cleaned_transcript: str = Field(..., min_length=1, max_length=12000)
     soap_note: SoapNote
+    source_digest: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        description="Optional SHA-256 digest of input transcript/audio for traceability without storing raw data.",
+    )
     safety: SafetyMeta = Field(default_factory=SafetyMeta)
+    provenance: ProvenanceMeta = Field(default_factory=ProvenanceMeta)
 
     @field_validator("cleaned_transcript", mode="after")
     @classmethod
@@ -515,6 +650,7 @@ class RedactionResult(ModelBase):
         description="Counts per redacted category (e.g., {'email': 1}).",
     )
     safety: SafetyMeta = Field(default_factory=SafetyMeta)
+    provenance: ProvenanceMeta = Field(default_factory=ProvenanceMeta)
 
 
 class ErrorEnvelope(ModelBase):
@@ -525,6 +661,84 @@ class ErrorEnvelope(ModelBase):
     detail: Optional[str] = Field(default=None, max_length=2000)
     hint: Optional[str] = Field(default=None, max_length=500)
     request_id: Optional[str] = Field(default=None, max_length=64)
+
+
+# -----------------------------------------------------------------------------
+# Endpoint-specific request/response contracts
+# (prevents clients from sending server-owned fields like id/safety/provenance)
+# -----------------------------------------------------------------------------
+
+class DiaryEntryCreateRequest(ModelBase):
+    timestamp: Optional[datetime] = Field(
+        default=None,
+        description="Optional; if omitted server may set now().",
+    )
+    source: EntrySource = Field(default=EntrySource.text)
+    text: str = Field(..., min_length=1, max_length=5000)
+    mood: MoodLabel = Field(default=MoodLabel.unknown)
+    tags: List[str] = Field(default_factory=list, max_length=32)
+    audio_ref: Optional[str] = Field(default=None, max_length=256)
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _tz_optional_ts(cls, v: Any) -> Any:
+        if isinstance(v, datetime):
+            return _to_utc(v)
+        return v
+
+
+class DiaryEntryCreateResponse(ModelBase):
+    entry: DiaryEntry
+
+
+class DiaryTrendsQuery(ModelBase):
+    period: DateRange = Field(..., description="Trend period.")
+    metrics: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of metric keys to include (if omitted, include all available).",
+        max_length=32,
+    )
+
+    @field_validator("metrics", mode="after")
+    @classmethod
+    def _norm_metrics(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return None
+        out: List[str] = []
+        for m in v:
+            s = _slug(m, max_len=64)
+            if s and s not in out:
+                out.append(s)
+        return out[:32]
+
+
+class DiaryTrendsResponse(ModelBase):
+    period: DateRange
+    points: List[TrendPoint] = Field(default_factory=list, max_length=2000)
+    insights: List[TrendInsight] = Field(default_factory=list, max_length=24)
+    safety: SafetyMeta = Field(default_factory=SafetyMeta)
+    provenance: ProvenanceMeta = Field(default_factory=ProvenanceMeta)
+
+
+class DiarySummaryRequest(ModelBase):
+    period: DateRange = Field(..., description="Summary period.")
+    # Optional explicit entries. If omitted, backend may load by period.
+    entries: Optional[List[DiaryEntry]] = Field(default=None, description="Optional diary entries to summarize.", max_length=200)
+
+
+class DiarySummaryResponse(ModelBase):
+    summary: DiarySummary
+
+
+class SoapFromTranscriptRequest(ModelBase):
+    transcript: str = Field(..., min_length=1, max_length=20000)
+
+    def digest(self) -> str:
+        return _sha256_hex(self.transcript)
+
+
+class SoapFromTranscriptResponse(ModelBase):
+    result: ClinicalNoteResult
 
 
 # -----------------------------------------------------------------------------
@@ -539,6 +753,7 @@ class SchemaExport:
 
 EXPORT_MODELS: Tuple[SchemaExport, ...] = (
     SchemaExport("SafetyMeta", SafetyMeta),
+    SchemaExport("ProvenanceMeta", ProvenanceMeta),
     SchemaExport("DateRange", DateRange),
     SchemaExport("Symptom", Symptom),
     SchemaExport("Medication", Medication),
@@ -551,6 +766,15 @@ EXPORT_MODELS: Tuple[SchemaExport, ...] = (
     SchemaExport("RedactionRequest", RedactionRequest),
     SchemaExport("RedactionResult", RedactionResult),
     SchemaExport("ErrorEnvelope", ErrorEnvelope),
+    # Endpoint contracts
+    SchemaExport("DiaryEntryCreateRequest", DiaryEntryCreateRequest),
+    SchemaExport("DiaryEntryCreateResponse", DiaryEntryCreateResponse),
+    SchemaExport("DiaryTrendsQuery", DiaryTrendsQuery),
+    SchemaExport("DiaryTrendsResponse", DiaryTrendsResponse),
+    SchemaExport("DiarySummaryRequest", DiarySummaryRequest),
+    SchemaExport("DiarySummaryResponse", DiarySummaryResponse),
+    SchemaExport("SoapFromTranscriptRequest", SoapFromTranscriptRequest),
+    SchemaExport("SoapFromTranscriptResponse", SoapFromTranscriptResponse),
 )
 
 def get_all_json_schemas() -> Dict[str, Dict[str, Any]]:
@@ -567,22 +791,39 @@ def get_all_json_schemas() -> Dict[str, Dict[str, Any]]:
 
 
 __all__ = [
+    # enums
     "EntrySource",
     "MoodLabel",
     "TrendDirection",
     "RiskLevel",
+    "DemoMode",
+    # shared
     "SafetyMeta",
+    "ProvenanceMeta",
     "DateRange",
+    # diary
     "Symptom",
     "Medication",
     "DiaryEntry",
     "TrendPoint",
     "TrendInsight",
     "DiarySummary",
+    # clinician
     "SoapNote",
     "ClinicalNoteResult",
+    # utils
     "RedactionRequest",
     "RedactionResult",
     "ErrorEnvelope",
+    # endpoint contracts
+    "DiaryEntryCreateRequest",
+    "DiaryEntryCreateResponse",
+    "DiaryTrendsQuery",
+    "DiaryTrendsResponse",
+    "DiarySummaryRequest",
+    "DiarySummaryResponse",
+    "SoapFromTranscriptRequest",
+    "SoapFromTranscriptResponse",
+    # schema export
     "get_all_json_schemas",
 ]
